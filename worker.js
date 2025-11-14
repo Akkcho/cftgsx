@@ -446,6 +446,102 @@ function parsePostTargets(commandText) {
   return { userIds, message }
 }
 
+// 生成10以内的加减法题目
+function generateMathQuestion() {
+  const num1 = Math.floor(Math.random() * 10) + 1; // 1-10
+  const num2 = Math.floor(Math.random() * 10) + 1; // 1-10
+  const operations = ['+', '-'];
+  const operation = operations[Math.floor(Math.random() * operations.length)];
+  
+  let answer;
+  let question;
+  
+  if (operation === '+') {
+    answer = num1 + num2;
+    question = `${num1} + ${num2}`;
+  } else {
+    // 确保减法结果为正数
+    if (num1 >= num2) {
+      answer = num1 - num2;
+      question = `${num1} - ${num2}`;
+    } else {
+      answer = num2 - num1;
+      question = `${num2} - ${num1}`;
+    }
+  }
+  
+  // 生成3个错误答案
+  const wrongAnswers = new Set();
+  while (wrongAnswers.size < 3) {
+    let wrong = answer + Math.floor(Math.random() * 10) - 5;
+    if (wrong !== answer && wrong >= 0 && wrong <= 20) {
+      wrongAnswers.add(wrong);
+    }
+  }
+  
+  // 组合所有选项并打乱
+  const options = [answer, ...Array.from(wrongAnswers)];
+  for (let i = options.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [options[i], options[j]] = [options[j], options[i]];
+  }
+  
+  return {
+    question,
+    answer,
+    options
+  };
+}
+
+// 检查用户是否已通过验证
+async function isUserVerified(userId, env) {
+  try {
+    if (!env.USER_STORAGE) return true; // 如果没有KV存储，跳过验证
+    if (env.ENABLE_FORUM_MODE !== 'true') return true; // 只在论坛模式下启用验证
+    
+    const verifiedData = await env.USER_STORAGE.get(`verified_user_${userId}`);
+    return verifiedData === 'true';
+  } catch (error) {
+    logError('isUserVerified', error, { userId });
+    return false;
+  }
+}
+
+// 设置用户验证状态
+async function setUserVerified(userId, env) {
+  try {
+    if (!env.USER_STORAGE) return;
+    await env.USER_STORAGE.put(`verified_user_${userId}`, 'true');
+    logInfo('setUserVerified', 'User verified', { userId });
+  } catch (error) {
+    logError('setUserVerified', error, { userId });
+  }
+}
+
+// 保存验证题目答案
+async function saveVerificationAnswer(userId, answer, env) {
+  try {
+    if (!env.USER_STORAGE) return;
+    await env.USER_STORAGE.put(`verification_answer_${userId}`, answer.toString(), {
+      expirationTtl: 300 // 5分钟过期
+    });
+  } catch (error) {
+    logError('saveVerificationAnswer', error, { userId });
+  }
+}
+
+// 获取验证题目答案
+async function getVerificationAnswer(userId, env) {
+  try {
+    if (!env.USER_STORAGE) return null;
+    const answer = await env.USER_STORAGE.get(`verification_answer_${userId}`);
+    return answer;
+  } catch (error) {
+    logError('getVerificationAnswer', error, { userId });
+    return null;
+  }
+}
+
 // 从KV存储获取用户列表
 async function getUsersFromKV(env) {
   try {
@@ -956,12 +1052,56 @@ async function handleUserMessage(message, env) {
     
     // 发送欢迎消息给新用户
     if (message.text === '/start') {
+      // 检查是否已验证
+      const verified = await isUserVerified(userInfo.userId, env);
+      
+      if (!verified && env.ENABLE_FORUM_MODE === 'true' && env.USER_STORAGE) {
+        // 生成验证题目
+        const mathQ = generateMathQuestion();
+        await saveVerificationAnswer(userInfo.userId, mathQ.answer, env);
+        
+        // 创建选项按钮
+        const keyboard = {
+          inline_keyboard: [
+            mathQ.options.slice(0, 2).map(opt => ({
+              text: opt.toString(),
+              callback_data: `verify:${userInfo.userId}:${opt}`
+            })),
+            mathQ.options.slice(2, 4).map(opt => ({
+              text: opt.toString(),
+              callback_data: `verify:${userInfo.userId}:${opt}`
+            }))
+          ]
+        };
+        
+        await sendMessage(
+          userInfo.chatId,
+          `👋 你好！欢迎使用消息转发机器人。\n\n🔐 为了防止垃圾信息，请先回答以下问题：\n\n❓ ${mathQ.question} = ?\n\n请选择正确答案：`,
+          env.BOT_TOKEN,
+          { reply_markup: keyboard }
+        );
+        return;
+      }
+      
       await sendMessage(
         userInfo.chatId, 
         `👋 你好！我是消息转发机器人。\n\n请发送你的消息，我会转发给管理员并尽快回复你。`, 
         env.BOT_TOKEN
       )
       return
+    }
+    
+    // 检查用户是否已验证（论坛模式下）
+    if (env.ENABLE_FORUM_MODE === 'true' && env.USER_STORAGE) {
+      const verified = await isUserVerified(userInfo.userId, env);
+      if (!verified) {
+        await sendMessage(
+          userInfo.chatId,
+          `⚠️ 请先发送 /start 完成验证后再发送消息。`,
+          env.BOT_TOKEN
+        );
+        return;
+      }
     }
 
     // 创建包含用户信息的转发消息
@@ -1412,6 +1552,88 @@ async function handleUsersCallbackQuery(callbackQuery, env) {
   }
 }
 
+// 处理验证回调
+async function handleVerificationCallbackQuery(callbackQuery, env) {
+  try {
+    const data = callbackQuery.data; // 格式: verify:userId:answer
+    const parts = data.split(':');
+    if (parts.length !== 3) {
+      await answerCallbackQuery(callbackQuery.id, env.BOT_TOKEN, '无效的验证数据', true);
+      return;
+    }
+    
+    const [, userIdStr, userAnswer] = parts;
+    const userId = callbackQuery.from.id;
+    const chatId = callbackQuery.message.chat.id;
+    const messageId = callbackQuery.message.message_id;
+    
+    // 验证用户ID匹配
+    if (userId.toString() !== userIdStr) {
+      await answerCallbackQuery(callbackQuery.id, env.BOT_TOKEN, '❌ 验证失败：用户不匹配', true);
+      return;
+    }
+    
+    // 获取正确答案
+    const correctAnswer = await getVerificationAnswer(userId, env);
+    if (!correctAnswer) {
+      await editMessageText(
+        chatId,
+        messageId,
+        `⚠️ 验证已过期，请重新发送 /start 开始验证。`,
+        env.BOT_TOKEN,
+        { reply_markup: { inline_keyboard: [] } }
+      );
+      await answerCallbackQuery(callbackQuery.id, env.BOT_TOKEN, '验证已过期');
+      return;
+    }
+    
+    // 检查答案是否正确
+    if (userAnswer === correctAnswer) {
+      // 验证成功
+      await setUserVerified(userId, env);
+      await editMessageText(
+        chatId,
+        messageId,
+        `✅ 验证成功！\n\n👋 欢迎使用消息转发机器人。现在你可以发送消息给管理员了。\n\n💬 请直接发送你想要转发的消息。`,
+        env.BOT_TOKEN,
+        { reply_markup: { inline_keyboard: [] } }
+      );
+      await answerCallbackQuery(callbackQuery.id, env.BOT_TOKEN, '✅ 答案正确！');
+      
+      logInfo('handleVerificationCallbackQuery', 'User verified successfully', { userId });
+    } else {
+      // 答案错误，生成新题目
+      const mathQ = generateMathQuestion();
+      await saveVerificationAnswer(userId, mathQ.answer, env);
+      
+      const keyboard = {
+        inline_keyboard: [
+          mathQ.options.slice(0, 2).map(opt => ({
+            text: opt.toString(),
+            callback_data: `verify:${userId}:${opt}`
+          })),
+          mathQ.options.slice(2, 4).map(opt => ({
+            text: opt.toString(),
+            callback_data: `verify:${userId}:${opt}`
+          }))
+        ]
+      };
+      
+      await editMessageText(
+        chatId,
+        messageId,
+        `❌ 答案错误，请重试：\n\n❓ ${mathQ.question} = ?\n\n请选择正确答案：`,
+        env.BOT_TOKEN,
+        { reply_markup: keyboard }
+      );
+      await answerCallbackQuery(callbackQuery.id, env.BOT_TOKEN, '❌ 答案错误，请重试');
+    }
+  } catch (error) {
+    logError('handleVerificationCallbackQuery', error);
+    await answerCallbackQuery(callbackQuery.id, env.BOT_TOKEN, '处理失败，请重试', true);
+  }
+}
+
 // 处理Webhook消息
 async function handleWebhook(request, env, ctx) {
   try {
@@ -1429,11 +1651,15 @@ async function handleWebhook(request, env, ctx) {
       // 使用 ctx.waitUntil 进行后台消息处理，不阻塞响应
       ctx.waitUntil(handleMessage(update.message, env))
     } else if (update.callback_query) {
-      // 内联按钮回调处理（仅用于 /users 分页）
+      // 内联按钮回调处理
       const cq = update.callback_query;
       const data = cq.data || '';
       if (data && data.startsWith('users:')) {
+        // /users 分页回调
         ctx.waitUntil(handleUsersCallbackQuery(cq, env));
+      } else if (data && data.startsWith('verify:')) {
+        // 验证回调
+        ctx.waitUntil(handleVerificationCallbackQuery(cq, env));
       }
     }
 
